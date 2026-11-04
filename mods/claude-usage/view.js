@@ -1,8 +1,9 @@
 // Drawing. Everything here reads shared(KEY) and the live agents(); nothing polls.
 import { div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, run, shared, theme, closeOverlay } from "herdr";
-import { KEY, MOD, isClaude, parseTime, until } from "./data.js";
+import { agents, run, shared, theme, closeOverlay, notify } from "herdr";
+import { KEY, MOD, interrupt, isClaude, parseTime, until } from "./data.js";
+import { clock } from "./forecast.js";
 import { AS_OF, modelName } from "./pricing.js";
 
 const ICON = (name) => `mods/${MOD}/${name}.svg`;
@@ -82,23 +83,42 @@ function quotaNote(q, t) {
   return say ? div().text_size(11.5).text_color(t.dim).child(say) : null;
 }
 
+const pace = (perHour) => (perHour >= 1 ? ` · ${Math.round(perHour)}%/h` : perHour > 0 ? ` · ${perHour.toFixed(1)}%/h` : "");
+
+// One line under a limit: when it runs out at the current pace, or why that isn't said.
+export function forecastLine(w, t) {
+  const f = w.forecast;
+  if (!f) return null;
+  const look = w.key === "five_hour" ? "30 min" : "3 h";
+  if (f.state === "at-limit") return [`At the limit until it resets`, t.ansi1];
+  if (f.state === "gathering") return [`Forecast after ${f.need} more min of samples`, t.dim];
+  if (f.state === "steady") return [`Not rising over the last ${look}`, t.dim];
+  if (f.state === "reset-first") return [`On pace to reset first${pace(f.perHour)}`, t.dim];
+  const soon = f.at - Date.now() <= 30 * 60000;
+  return [`At this pace, runs out at ${clock(f.at)} (in ${until(f.at)})${pace(f.perHour)}`, soon ? t.ansi1 : t.ansi3];
+}
+
 function quotaRows(q, t, wide) {
   const rows = (q?.windows ?? []).map((w) => {
     const color = level(w.pct, t);
     const resets = w.resets ? `resets in ${until(parseTime(w.resets))}` : "";
+    const line = forecastLine(w, t);
     if (wide) {
-      return h_flex().gap(12).items_center().h(22)
-        .child(div().w(104).flex_none().text_size(12.5).text_color(t.muted).child(w.label))
-        .child(div().flex_1().child(bar(`q-${w.key}`, w.pct, t, 8)))
-        .child(div().w(44).flex_none().text_right().text_size(13).font_semibold().text_color(color).child(`${Math.round(w.pct)}%`))
-        .child(div().w(130).flex_none().text_size(11.5).text_color(t.dim).child(resets));
+      return v_flex().gap(1)
+        .child(h_flex().gap(12).items_center().h(20)
+          .child(div().w(104).flex_none().text_size(12.5).text_color(t.muted).child(w.label))
+          .child(div().flex_1().child(bar(`q-${w.key}`, w.pct, t, 8)))
+          .child(div().w(44).flex_none().text_right().text_size(13).font_semibold().text_color(color).child(`${Math.round(w.pct)}%`))
+          .child(div().w(130).flex_none().text_size(11.5).text_color(t.dim).child(resets)))
+        .when(Boolean(line), (el) => el.child(div().pl(116).text_size(11).text_color(line[1]).child(line[0])));
     }
     return v_flex().gap(4)
       .child(h_flex().items_center().gap(6).text_size(12)
         .child(div().flex_1().text_color(t.muted).child(w.label))
         .child(div().text_size(11).text_color(t.dim).child(resets))
         .child(div().w(36).text_right().font_semibold().text_color(color).child(`${Math.round(w.pct)}%`)))
-      .child(bar(`q-${w.key}`, w.pct, t, 6));
+      .child(bar(`q-${w.key}`, w.pct, t, 6))
+      .when(Boolean(line), (el) => el.child(div().text_size(11).text_color(line[1]).child(line[0])));
   });
   const note = quotaNote(q, t);
   return note && q?.state !== "ok" ? [...rows, note] : rows;
@@ -130,21 +150,81 @@ function today(s, t, wide) {
         .child(div().w(wide ? 74 : 64).flex_none().text_right().text_color(t.muted).child(usd(v.cost)))))));
 }
 
+const WEEK = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const shortUsd = (c) => (c >= 1000 ? `$${(c / 1000).toFixed(1)}K` : c >= 10 ? `$${Math.round(c)}` : c > 0 ? `$${c.toFixed(2)}` : "–");
+
+// The last seven days' cost, a bar a day, today last and in `accent`.
+function week(s, t, height) {
+  const days = s?.history ?? [];
+  if (!days.length) return null;
+  const max = Math.max(...days.map((d) => d.cost), 0.01);
+  return h_flex().gap(5).items_end().children(days.map((d) => {
+    const [y, m, dd] = d.date.split("-").map(Number);
+    const isToday = d.date === s?.today?.date;
+    return v_flex().id(`day-${d.date}`).flex_1().min_w(0).items_center().gap(3)
+      .child(div().text_size(10).text_color(isToday ? t.foreground : t.dim).child(shortUsd(d.cost)))
+      .child(v_flex().h(height).w_full().justify_end().child(
+        div().id(`day-${d.date}-bar`).w_full().h(Math.max(2, Math.round((d.cost / max) * height))).rounded(3)
+          .bg(isToday ? t.accent : t.accent + "59").transition("height", { duration: 450, easing: "ease-out" })))
+      .child(div().text_size(10.5).text_color(isToday ? t.foreground : t.muted).child(WEEK[new Date(y, m - 1, dd).getDay()]));
+  }));
+}
+
+// Interrupt for the top spender: a first click arms it for 3 seconds, a second stops
+// the agent's turn. `ui` is the drawing copy's own state.
+function stopButton(a, t, ui) {
+  const armed = ui.armed?.address === a.address && Date.now() < ui.armed.until;
+  const stopping = ui.stopping === a.address;
+  const label = stopping ? "Stopping…" : armed ? "Click again to stop" : "Interrupt";
+  return div().id(`stop-${a.address}`).flex_none().h(20).px(8).rounded(5).text_size(11).flex().items_center()
+    .when(armed, (el) => el.bg(t.ansi1).text_color(t.background).font_semibold())
+    .when(!armed, (el) => el.border(1).border_color(t.input).text_color(stopping ? t.dim : t.muted))
+    .when(!a.demo && !stopping, (el) => el.cursor_pointer().hover((st) => (armed ? st : st.bg(t.hover).text_color(t.foreground))))
+    .on_click((_e, cx) => { cx.stop_propagation(); pressStop(a, ui, cx); })
+    .child(label);
+}
+
+/** One press of Interrupt: arms on the first, interrupts on a second within 3 s. */
+export function pressStop(a, ui, cx) {
+  const armed = ui.armed?.address === a.address && Date.now() < ui.armed.until;
+  if (a.demo || ui.stopping === a.address) return;
+  if (!armed) {
+    const until = Date.now() + 3000;
+    ui.armed = { address: a.address, until };
+    cx.timer.after(3000, (cx) => { if (ui.armed?.until === until) { ui.armed = null; cx.notify(); } });
+  } else {
+    ui.armed = null;
+    ui.stopping = a.address;
+    const name = a.title || a.address;
+    cx.spawn(async (cx) => {
+      const outcome = await interrupt(a.address);
+      ui.stopping = null;
+      notify(outcome === "stopped"
+        ? { title: `Stopped ${name}`, body: "Its turn was interrupted. Type in its terminal to carry on.", level: "success", timeout: 6000 }
+        : { title: `Couldn't confirm ${name} stopped`, body: outcome === "still_working" ? "It still reports working after two Escape presses." : outcome, level: "warning", timeout: 8000 });
+      cx.notify();
+    });
+  }
+  cx.notify();
+}
+
 function agentDetail(u) {
   if (!u) return null;
   const model = u.model ? `${modelName(u.model)} · ` : "";
   return `${model}in ${tokens(u.input)} · out ${tokens(u.output)} · cache ${tokens(u.read)} read, ${tokens(u.write)} write`;
 }
 
-function agentRow(a, t, wide, overlay) {
+function agentRow(a, t, wide, overlay, top, ui) {
   const u = a.usage;
+  const hot = top?.address === a.address;
   const where = [a.space_name, a.tab_name].filter(Boolean).join(" / ");
   const sub = a.remote ? "on another machine: no local transcript"
     : u ? agentDetail(u) : "session not found yet";
   const price = u ? (u.unpriced ? `${usd(u.cost)}+` : usd(u.cost)) : "";
   return h_flex().id(`agent-${a.address}`).gap(8).px(8).py(wide ? 6 : 5).rounded(7).items_start()
-    .when(a.focused, (el) => el.bg(t.selected))
-    .when(!a.demo && !a.remote, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)))
+    .when(a.focused && !hot, (el) => el.bg(t.selected))
+    .when(hot, (el) => el.bg(t.ansi3 + "14").border(1).border_color(t.ansi3 + "59"))
+    .when(!a.demo && !a.remote, (el) => el.cursor_pointer().hover((s) => s.bg(hot ? t.ansi3 + "24" : t.hover)))
     .on_click(() => focusAgent(a, overlay))
     .child(h_flex().pt(2).gap(6).items_center().flex_none().child(status(a, t)).child(programIcon(a, t)))
     .child(v_flex().flex_1().min_w(0).gap(2)
@@ -152,7 +232,11 @@ function agentRow(a, t, wide, overlay) {
         .child(div().min_w(0).truncate().text_size(13).text_color(t.foreground).child(a.title || a.address))
         .when(wide && Boolean(where), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(where))))
       .child(div().truncate().text_size(11).text_color(u?.how === "folder" ? t.ansi3 : t.dim).child((u?.how === "folder" ? "≈ " : "") + sub)))
-    .child(div().flex_none().pt(1).text_size(13).font_medium().text_color(t.foreground).child(price));
+    .child(v_flex().flex_none().pt(1).gap(3).items_end()
+      .child(div().text_size(13).font_medium().text_color(t.foreground).child(price))
+      .when(hot, (el) => el
+        .child(div().text_size(11).font_medium().text_color(t.ansi3).child(`top spender · ${usd(top.perMin)}/min`))
+        .child(stopButton(a, t, ui))));
 }
 
 function header(s, t) {
@@ -169,7 +253,7 @@ const footnote = (t) => div().text_size(10.5).text_color(t.dim)
   .child(`Costs are estimates at API list prices (${AS_OF}); a subscription is not billed per token.`);
 
 /** The popup: everything, wide. */
-export function popup(overlay) {
+export function popup(overlay, ui) {
   const t = theme();
   const s = shared(KEY);
   const rows = agentRows(s);
@@ -178,32 +262,38 @@ export function popup(overlay) {
     .child(header(s, t))
     .child(v_flex().gap(6).children(quotaRows(s?.quota, t, true)))
     .child(div().h(1).bg(t.border))
-    .child(section("Today, every Claude Code session", t))
-    .child(today(s, t, true))
+    .child(h_flex().gap(24).items_start()
+      .child(v_flex().flex_1().min_w(0).gap(8).child(section("Today, every Claude Code session", t)).child(today(s, t, true)))
+      .when(Boolean(s?.history?.length), (el) => el.child(v_flex().w(250).flex_none().gap(8)
+        .child(section("Last 7 days", t, usd((s.history ?? []).reduce((n, d) => n + d.cost, 0))))
+        .child(week(s, t, 74)))))
     .child(div().h(1).bg(t.border))
     .child(section(`Agents in Herdr (${rows.length})`, t, rows.length ? `${usd(total)} across their sessions` : ""))
     .child(v_flex().id("agents").max_h(380).overflow_y_scrollbar().gap(1).children(
-      rows.length ? rows.map((a) => agentRow(a, t, true, overlay))
+      rows.length ? rows.map((a) => agentRow(a, t, true, overlay, s?.top, ui))
         : [div().px(8).text_size(12).text_color(t.dim).child("No Claude Code agents are running in Herdr.")]))
     .child(footnote(t))
     .when(Boolean(s?.error), (el) => el.child(div().text_size(11).text_color(t.ansi1).child(s.error)));
 }
 
 /** The panel: a pane or a layout block, narrow and tall. */
-export function panel() {
+export function panel(ui) {
   const t = theme();
   const s = shared(KEY);
   const rows = agentRows(s);
-  return v_flex().id("root").size_full().bg(t.surface).p(12).gap(10)
-    .child(header(s, t))
-    .child(v_flex().gap(8).children(quotaRows(s?.quota, t, false)))
-    .child(section("Today", t))
-    .child(today(s, t, false))
-    .child(section(`Agents (${rows.length})`, t))
-    .child(v_flex().id("agents").flex_1().min_h(0).overflow_y_scrollbar().gap(1).children(
-      rows.length ? rows.map((a) => agentRow(a, t, false, null))
-        : [div().px(8).text_size(12).text_color(t.dim).child("No Claude Code agents running.")]))
-    .child(footnote(t));
+  // One scroll for the whole panel: a short pane still reaches every agent.
+  return v_flex().id("root").size_full().bg(t.surface).child(
+    v_flex().id("panel-scroll").size_full().overflow_y_scrollbar().p(12).gap(10)
+      .child(header(s, t))
+      .child(v_flex().gap(8).children(quotaRows(s?.quota, t, false)))
+      .child(section("Today", t))
+      .child(today(s, t, false))
+      .when(Boolean(s?.history?.length), (el) => el.child(section("Last 7 days", t)).child(week(s, t, 36)))
+      .child(section(`Agents (${rows.length})`, t))
+      .child(v_flex().id("agents").gap(1).children(
+        rows.length ? rows.map((a) => agentRow(a, t, false, null, s?.top, ui))
+          : [div().px(8).text_size(12).text_color(t.dim).child("No Claude Code agents running.")]))
+      .child(footnote(t)));
 }
 
 /** A floating block in a layout: the limits as rows whose percentage sits on the

@@ -11,6 +11,7 @@ import * as view from "./view.js";
 export default class ClaudeUsage extends View {
   init(_props, cx) {
     this.props = props() ?? {};
+    this.ui = { armed: null, stopping: null }; // the Interrupt button's state, this copy only
     this.collector = new Collector();
     this.collector.start(cx);
   }
@@ -18,11 +19,11 @@ export default class ClaudeUsage extends View {
   render() {
     const place = placement();
     if (place) return view.drawer(place);
-    if (this.props.view === "panel") return view.panel();
-    return view.popup(this.props.overlay);
+    if (this.props.view === "panel") return view.panel(this.ui);
+    return view.popup(this.props.overlay, this.ui);
   }
 
-  close() {
-    this.collector.release();
+  async close() {
+    await this.collector.release();
   }
 }

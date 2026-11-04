@@ -5,8 +5,10 @@ How much of your Claude limits your agents are using, inside the [Herdr](https:/
 ![Claude usage in Herdr](preview.png)
 
 - **Account limits**: your 5-hour and weekly use, plus any per-model weekly limit, as bars that turn amber at 80% and red at 95%, with the time until each resets. A toast tells you once when a limit passes 80% and once at 95%.
+- **Forecast**: "At this pace, runs out at 5:24 pm (in 28m)", from how fast each limit has climbed lately, or "On pace to reset first". A toast warns once when a limit will run out within 30 minutes. No forecast until there are enough samples to mean something.
+- **Top spender, with Interrupt**: the agent spending the most in the last 15 minutes is highlighted with its rate ("$0.42/min") and an **Interrupt** button. Click it, then click again within 3 seconds, and its turn stops, as if you had pressed Escape in it.
 - **Every agent's session**: for each Claude Code agent in Herdr, its session's tokens (input, output, cache read and write, subagents included), its model and an estimated cost. Click a row to go to that agent.
-- **Today**: the estimated cost and tokens of every Claude Code session on this computer since midnight, by model.
+- **Today and the last 7 days**: the estimated cost and tokens of every Claude Code session on this computer since midnight, by model, and a bar a day for the week.
 - **Popup** (`ctrl-b u`) with the full breakdown, and a **panel** (`ctrl-b y`) that sits beside your terminals.
 
 ## Install
@@ -29,7 +31,8 @@ If your Claude Code folder isn't `~/.claude` (or `$CLAUDE_CONFIG_DIR`), write `~
 ## What it touches
 
 - **Reads** Claude Code's files: `~/.claude/projects/**/*.jsonl` (transcripts, for token counts) and `~/.claude/sessions/<pid>.json` (which session each running Claude Code is in). It reads only the bytes added since it last looked.
-- **Runs** `sh`, `find`, `wc`, `tail`, `head` and `awk` (through its own `scan.sh` and `scan.awk`), and `ls` when an agent's session can't be found from its process.
+- **Runs** `sh`, `find`, `wc`, `tail`, `head` and `awk` (through its own `scan.sh` and `scan.awk`), `cat` for its cache, and `ls` when an agent's session can't be found from its process. **Interrupt** runs `hc interrupt <agent>`, only after your second click.
+- **Writes** one file, `~/.config/herdr-app/claude-usage.cache.json`: how far it has read each transcript and the per-day totals, so a restart doesn't read a week of transcripts again. Delete it any time.
 - **Reads your Claude Code sign-in** to ask for your limits: on macOS with `security find-generic-password -s "Claude Code-credentials"` (the Keychain may ask you to allow this once), elsewhere from `~/.claude/.credentials.json`. The token is sent only to `api.anthropic.com` and is never stored, shown or logged. It never refreshes the token; Claude Code does that.
 - **Fetches** `https://api.anthropic.com/api/oauth/usage` at most once every 90 seconds (every 5 minutes after an error). It is not a documented public API, so it may change or stop answering. Without a sign-in, the limits are left out and everything else still works.
 

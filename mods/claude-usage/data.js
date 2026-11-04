@@ -14,8 +14,11 @@
 //   api.anthropic.com/api/oauth/usage   the account's 5-hour and weekly use, with
 //                                   Claude Code's OAuth token (Keychain on macOS,
 //                                   ~/.claude/.credentials.json elsewhere).
-import { exec, readTextFile, appHome, home, agents, terminals, shared, setShared, notify, window as appWindow } from "herdr";
+// What has been read is cached in <Herdr home>/claude-usage.cache.json, so a restart
+// or a new collector reads only what was written since.
+import { exec, hc, readTextFile, writeTextFile, appHome, home, agents, terminals, shared, setShared, notify, window as appWindow } from "herdr";
 import { cost } from "./pricing.js";
+import { addSamples, clock, forecast, resetKey } from "./forecast.js";
 
 export const MOD = "claude-usage";
 export const KEY = "claude-usage";
@@ -25,8 +28,12 @@ const QUOTA_BACKOFF = 300000; // after an error or an expired sign-in
 const LEASE_STALE = 100000;
 const HEARTBEAT = 45000;
 const READ_BATCH = 150e6;     // bytes per scan.sh read, to stay inside exec's 30 s
+const RECENT = 15 * 60000;    // "spending now" looks this far back
+const HISTORY_DAYS = 7;
+const SAVE_EVERY = 120000;
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const ALERTS = [80, 95];
+const RUNS_OUT_SOON = 30 * 60000;
 
 const me = Math.random().toString(36).slice(2);
 const expand = (p) => p.replace(/^~(?=\/|$)/, home());
@@ -54,11 +61,33 @@ async function envClaudeDir() {
   return envDir;
 }
 
+/** Stops an agent's turn: `hc interrupt` presses that program's stop key (Escape for
+ *  Claude Code) and watches for the effect. With Claude Code's vim mode on, the first
+ *  Escape only leaves insert mode, so a turn still running gets a second press.
+ *  Returns "stopped", "still_working" or an error message. */
+export async function interrupt(address) {
+  const once = async () => {
+    const r = await hc(["interrupt", address, "--json", "--timeout", "4"]);
+    try { return JSON.parse(r.stdout).outcome ?? (r.stderr.trim() || `exit ${r.code}`); }
+    catch { return r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`; }
+  };
+  try {
+    const first = await once();
+    return first === "still_working" ? await once() : first;
+  } catch (e) {
+    return String(e?.message ?? e);
+  }
+}
+
 export class Collector {
   constructor() {
-    this.files = new Map();    // path -> { offset, lastId, model, days: { date: { model: totals } } }
+    this.files = new Map();    // path -> { offset, lastId, model, days: { date: { model: totals } }, recent: [[ms, usd]] }
     this.sessions = new Map(); // address -> { session, how }
     this.busy = false;
+    this.cache = undefined;    // the cache file's text as last read or written
+    this.cacheRoot = null;
+    this.savedAt = 0;
+    this.dirty = false;
   }
 
   start(cx) {
@@ -66,10 +95,12 @@ export class Collector {
     cx.timer.every(TICK, (cx) => this.tick(cx));
   }
 
-  // A closing copy (a popup going away) hands the lease back at once.
-  release() {
+  // A closing copy (a popup going away) saves what it read and hands the lease back.
+  async release() {
     const s = shared(KEY);
-    if (s?.owner === me) setShared(KEY, { ...s, owner: null, beat: 0 });
+    if (s?.owner !== me) return;
+    setShared(KEY, { ...s, owner: null, beat: 0 });
+    if (this.dirty) await this.save().catch(() => {});
   }
 
   tick(cx) {
@@ -86,12 +117,22 @@ export class Collector {
   async collect() {
     const cfg = await config();
     const prev = shared(KEY) ?? {};
+    const now = Date.now();
+    if (cfg.demo && this.cacheRoot) { this.files.clear(); this.cacheRoot = null; } // demo data never reaches the cache
+    if (!cfg.demo && this.cacheRoot !== cfg.claude) await this.load(cfg.claude);
     const rows = await this.agentSessions(cfg);
     await this.scan(cfg, rows.map((r) => r.session).filter(Boolean));
 
-    const today = dayOf(Date.now());
+    const today = dayOf(now);
     const day = { date: today, cost: 0, input: 0, output: 0, read: 0, write: 0, replies: 0, sessions: 0, unpriced: [], models: {} };
+    const dates = [];
+    for (let i = HISTORY_DAYS - 1; i >= 0; i--) { const d = new Date(now); d.setDate(d.getDate() - i); dates.push(dayOf(d.getTime())); }
+    const history = Object.fromEntries(dates.map((d) => [d, 0]));
     for (const [path, f] of this.files) {
+      f.recent = f.recent.filter(([t]) => now - t < RECENT);
+      for (const [date, d] of Object.entries(f.days)) {
+        if (date in history) for (const t of Object.values(d)) history[date] += t.cost;
+      }
       const d = f.days[today];
       if (!d) continue;
       if (!path.includes("/subagents/")) day.sessions++;
@@ -106,24 +147,32 @@ export class Collector {
     const usage = {};
     for (const r of rows) {
       if (!r.session) continue;
-      const u = { session: r.session, how: r.how, model: null, cost: 0, input: 0, output: 0, read: 0, write: 0, replies: 0, unpriced: false, files: 0, last: 0 };
+      const u = { session: r.session, how: r.how, model: null, cost: 0, input: 0, output: 0, read: 0, write: 0, replies: 0, unpriced: false, files: 0, recent: 0 };
       for (const [path, f] of this.files) {
         if (!path.endsWith(`/${r.session}.jsonl`) && !path.includes(`/${r.session}/subagents/`)) continue;
         u.files++;
         if (!path.includes("/subagents/") && f.model) u.model = f.model;
         for (const d of Object.values(f.days)) for (const t of Object.values(d)) { add(u, t); u.unpriced ||= t.unpriced; }
+        for (const [, usd] of f.recent) u.recent += usd;
       }
+      u.cost = round(u.cost); u.recent = round(u.recent);
       usage[r.address] = u;
     }
+    // The agent spending most in the last 15 minutes, if any is spending at all.
+    const top = Object.entries(usage).filter(([, u]) => u.recent >= 0.01).sort((a, b) => b[1].recent - a[1].recent)[0];
 
     const quota = await this.quota(cfg, prev.quota);
-    const alerts = this.alert(quota, prev.alerts ?? {});
+    for (const w of quota.windows ?? []) w.forecast = forecast(w, quota.samples?.[w.key], now, parseTime(w.resets));
+    const alerts = this.alert(quota, prev.alerts ?? {}, now);
     const next = {
-      v: 1, demo: Boolean(cfg.demo), error: cfg.error ?? null,
-      quota, today: day, usage, alerts,
+      v: 2, demo: Boolean(cfg.demo), error: cfg.error ?? null,
+      quota, today: { ...day, cost: round(day.cost) }, usage, alerts,
+      top: top ? { address: top[0], perMin: round(top[1].recent / (RECENT / 60000)), window: RECENT / 60000 } : null,
+      history: dates.map((d) => ({ date: d, cost: round(history[d]) })),
       demoAgents: cfg.demo ? rows : null,
     };
     this.publish(next, prev);
+    if (!cfg.demo && this.dirty && now - this.savedAt > SAVE_EVERY) await this.save().catch(() => {});
   }
 
   // Each write redraws every mod in the window, so write only what changed, plus a
@@ -171,26 +220,27 @@ export class Collector {
 
   async scan(cfg, sessions) {
     const script = `${appHome()}/mods/${MOD}/scan.sh`;
-    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
-    const mins = Math.ceil((Date.now() - midnight.getTime()) / 60000) + 1;
+    const first = new Date(); first.setHours(0, 0, 0, 0); first.setDate(first.getDate() - (HISTORY_DAYS - 1));
+    const mins = Math.ceil((Date.now() - first.getTime()) / 60000) + 1;
     const listed = await exec("sh", [script, "list", `${cfg.claude}/projects`, String(mins), ...new Set(sessions)], { cwd: home() });
     const sizes = new Map();
     for (const line of listed.stdout.split("\n")) {
       const m = /^\s*(\d+)\s+(\/.*\.jsonl)$/.exec(line);
       if (m) sizes.set(m[2], Number(m[1]));
     }
-    for (const path of [...this.files.keys()]) if (!sizes.has(path)) this.files.delete(path);
+    for (const path of [...this.files.keys()]) if (!sizes.has(path)) { this.files.delete(path); this.dirty = true; }
 
     let batch = [], bytes = 0;
     const flush = async () => {
       if (!batch.length) return;
       const r = await exec("sh", [script, "read", `${appHome()}/mods/${MOD}/scan.awk`, ...batch.flat()], { cwd: home() });
       this.ingest(r.stdout);
+      this.dirty = true;
       batch = []; bytes = 0;
     };
     for (const [path, size] of sizes) {
       let f = this.files.get(path);
-      if (!f || size < f.offset) this.files.set(path, (f = { offset: 0, lastId: null, model: null, days: {} }));
+      if (!f || size < f.offset) this.files.set(path, (f = { offset: 0, lastId: null, model: null, days: {}, recent: [] }));
       if (size === f.offset) continue;
       batch.push([path, String(f.offset), String(size)]);
       bytes += size - f.offset;
@@ -201,6 +251,7 @@ export class Collector {
 
   ingest(out) {
     let f = null;
+    const now = Date.now();
     for (const line of out.split("\n")) {
       if (!line) continue;
       const cols = line.split("\t");
@@ -214,12 +265,45 @@ export class Collector {
       f.model = model;
       const [input, output, read, w5, w1] = n.slice(0, 5).map((x) => Number(x) || 0);
       const usd = cost(model, input, output, read, w5, w1, n[5]);
-      const when = parseTime(ts) || Date.now();
+      const when = parseTime(ts) || now;
       const d = (f.days[dayOf(when)] ??= {});
       const t = (d[model] ??= { cost: 0, input: 0, output: 0, read: 0, w5: 0, w1: 0, replies: 0, unpriced: false });
       t.cost += usd ?? 0; t.unpriced ||= usd === null;
       t.input += input; t.output += output; t.read += read; t.w5 += w5; t.w1 += w1; t.replies++;
+      if (usd && now - when < RECENT) f.recent.push([when, usd]);
     }
+  }
+
+  // The cache holds each file's offset and its per-day totals, nothing of the content.
+  async load(root) {
+    this.cacheRoot = root;
+    const path = `${appHome()}/claude-usage.cache.json`;
+    const r = await exec("cat", [path]).catch(() => null);
+    this.cache = r?.code === 0 ? r.stdout : null;
+    let c = null;
+    try { c = this.cache ? JSON.parse(this.cache) : null; } catch {}
+    if (c?.v !== 1 || c.root !== root) return;
+    for (const [p, f] of Object.entries(c.files ?? {})) {
+      this.files.set(p, { offset: f.o, lastId: f.i, model: f.m, days: f.d ?? {}, recent: f.r ?? [] });
+    }
+  }
+
+  async save() {
+    if (!this.cacheRoot) return;
+    const path = `${appHome()}/claude-usage.cache.json`;
+    const files = {};
+    for (const [p, f] of this.files) files[p] = { o: f.offset, i: f.lastId, m: f.model, d: f.days, r: f.recent };
+    const text = JSON.stringify({ v: 1, root: this.cacheRoot, files });
+    try {
+      await writeTextFile(path, text, this.cache ?? null);
+    } catch {
+      // Another copy wrote it since: take its text as the snapshot and write over it.
+      const r = await exec("cat", [path]).catch(() => null);
+      await writeTextFile(path, text, r?.code === 0 ? r.stdout : null);
+    }
+    this.cache = text;
+    this.savedAt = Date.now();
+    this.dirty = false;
   }
 
   async quota(cfg, last) {
@@ -228,10 +312,20 @@ export class Collector {
     if (!cfg.demo && last?.fetched && now - last.fetched < wait && last.source === "live") return last;
     if (cfg.demo) {
       const text = await readTextFile(cfg.demo + "/quota.json").catch(() => null);
-      try { return { ...parseQuota(JSON.parse(text)), plan: "Demo", source: "demo", fetched: now }; }
-      catch { return { state: "none", source: "demo", fetched: now }; }
+      try {
+        const j = JSON.parse(text);
+        const q = parseQuota(j);
+        // The demo's samples are given as [minutes ago, percent].
+        const samples = {};
+        for (const w of q.windows) {
+          const pts = (j.demo_samples?.[w.key] ?? []).map(([ago, p]) => [now - ago * 60000, p]);
+          samples[w.key] = { reset: resetKey(w.resets), points: pts };
+        }
+        return { ...q, plan: "Demo", source: "demo", fetched: now, samples };
+      } catch { return { state: "none", source: "demo", fetched: now, windows: [] }; }
     }
-    const result = (q) => ({ ...q, source: "live", fetched: now });
+    const samples = last?.source === "live" ? last.samples : {};
+    const result = (q) => ({ ...q, source: "live", fetched: now, samples: q.state === "ok" ? addSamples(samples, q.windows, now) : samples ?? {} });
     const oauth = await credentials(cfg);
     if (!oauth?.accessToken) return result({ state: "signed-out", windows: [] });
     const plan = planName(oauth);
@@ -246,15 +340,17 @@ export class Collector {
     }
   }
 
-  // A toast once when a window passes 80% and once at 95%, per reset period.
-  alert(quota, fired) {
+  // Toasts, each once per reset period: a limit passing 80%, then 95%, and a
+  // forecast that says the limit runs out within 30 minutes.
+  alert(quota, fired, now) {
     const next = {};
     for (const w of quota.windows ?? []) {
-      const key = `${w.key}@${w.resets}`;
-      let level = fired[key] ?? 0;
+      const key = `${w.key}@${resetKey(w.resets)}`;
+      const was = fired[key] ?? {};
+      const at = { level: was.level ?? 0, soon: was.soon ?? false };
       const reached = ALERTS.filter((a) => w.pct >= a).pop() ?? 0;
-      if (reached > level) {
-        level = reached;
+      if (reached > at.level) {
+        at.level = reached;
         notify({
           title: `Claude ${w.label.toLowerCase()} limit at ${Math.round(w.pct)}%`,
           body: w.resets ? `Resets in ${until(parseTime(w.resets))}.` : undefined,
@@ -262,11 +358,23 @@ export class Collector {
           timeout: 10000,
         });
       }
-      if (level) next[key] = level;
+      const f = w.forecast;
+      if (!at.soon && f?.state === "runs-out" && f.at - now <= RUNS_OUT_SOON) {
+        at.soon = true;
+        notify({
+          title: `Claude ${w.label.toLowerCase()} limit runs out around ${clock(f.at, now)}`,
+          body: `At this pace, in ${until(f.at)}, before it resets in ${until(parseTime(w.resets))}.`,
+          level: "warning",
+          timeout: 12000,
+        });
+      }
+      if (at.level || at.soon) next[key] = at;
     }
     return next;
   }
 }
+
+const round = (n) => Math.round(n * 1e4) / 1e4;
 
 function add(into, t) {
   into.cost += t.cost; into.input += t.input; into.output += t.output;
