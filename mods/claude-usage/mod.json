@@ -1,0 +1,1 @@
+{ "place": "none", "title": "Claude usage", "overlay": { "kind": "popup", "at": "top", "offset": 40, "width": 720, "height": 760 } }

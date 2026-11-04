@@ -1,0 +1,10 @@
+{
+  "global": {
+    "ctrl-b u": "mod.open:claude-usage",
+    "ctrl-b y": { "command": "pane.split", "args": { "direction": "right", "mod": "claude-usage", "props": { "view": "panel" } } }
+  },
+  "terminal": {
+    "ctrl-b u": "mod.open:claude-usage",
+    "ctrl-b y": { "command": "pane.split", "args": { "direction": "right", "mod": "claude-usage", "props": { "view": "panel" } } }
+  }
+}
