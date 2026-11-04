@@ -2,6 +2,8 @@
 
 How much of your Claude limits your agents are using, inside the [Herdr](https://herdr.dev) desktop app.
 
+![Claude usage in Herdr: the popup's forecast turning red, the top spender's Interrupt button armed, then the panel with the 7-day chart](demo.gif)
+
 ![Claude usage in Herdr](preview.png)
 
 - **Account limits**: your 5-hour and weekly use, plus any per-model weekly limit, as bars that turn amber at 80% and red at 95%, with the time until each resets. A toast tells you once when a limit passes 80% and once at 95%.
