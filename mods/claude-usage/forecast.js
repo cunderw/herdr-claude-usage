@@ -15,19 +15,24 @@ const RULES = {
 };
 const KEEP = 3 * 60 * MIN + 5 * MIN;
 
-// The endpoint writes the same reset time with different microseconds on every
-// call; a window is the same window while its reset minute is.
-export const resetKey = (resets) => String(resets ?? "").slice(0, 16);
+// The endpoint writes the same reset time a little differently on every call
+// ("00:20:00.369209", "00:19:59.98…"): a window is the same window while its reset
+// time rounds to the same minute.
+export const resetKey = (resets) => {
+  const ms = resets ? new Date(String(resets).replace(/(\.\d{3})\d+/, "$1")).getTime() : NaN;
+  return Number.isFinite(ms) ? new Date(Math.round(ms / MIN) * MIN).toISOString().slice(0, 16) : String(resets ?? "");
+};
 
-/** Adds a fetch's percentages to the samples. A window that reset, or went down,
- *  starts over. Returns new samples: { [key]: { reset, points: [[ms, pct]] } }. */
+/** Adds a fetch's percentages to the samples. A window whose reset time moved, or
+ *  that fell by 10 points or more, starts over. Smaller dips count toward the slope.
+ *  Returns new samples: { [key]: { reset, points: [[ms, pct]] } }. */
 export function addSamples(samples, windows, now) {
   const next = {};
   for (const w of windows) {
     const old = samples?.[w.key];
     let points = old && old.reset === resetKey(w.resets) ? old.points.filter(([t]) => now - t < KEEP) : [];
     const last = points[points.length - 1];
-    if (last && w.pct < last[1] - 0.5) points = [];
+    if (last && w.pct <= last[1] - 10) points = [];
     if (!last || now - last[0] > 30000) points = [...points, [now, w.pct]];
     next[w.key] = { reset: resetKey(w.resets), points };
   }

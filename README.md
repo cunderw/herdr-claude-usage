@@ -34,7 +34,7 @@ If your Claude Code folder isn't `~/.claude` (or `$CLAUDE_CONFIG_DIR`), write `~
 - **Runs** `sh`, `find`, `wc`, `tail`, `head` and `awk` (through its own `scan.sh` and `scan.awk`), `cat` for its cache, and `ls` when an agent's session can't be found from its process. **Interrupt** runs `hc interrupt <agent>`, only after your second click.
 - **Writes** one file, `~/.config/herdr-app/claude-usage.cache.json`: how far it has read each transcript and the per-day totals, so a restart doesn't read a week of transcripts again. Delete it any time.
 - **Reads your Claude Code sign-in** to ask for your limits: on macOS with `security find-generic-password -s "Claude Code-credentials"` (the Keychain may ask you to allow this once), elsewhere from `~/.claude/.credentials.json`. The token is sent only to `api.anthropic.com` and is never stored, shown or logged. It never refreshes the token; Claude Code does that.
-- **Fetches** `https://api.anthropic.com/api/oauth/usage` at most once every 90 seconds (every 5 minutes after an error). It is not a documented public API, so it may change or stop answering. Without a sign-in, the limits are left out and everything else still works.
+- **Fetches** `https://api.anthropic.com/api/oauth/usage` at most once every 2 minutes (every 5 minutes after an error; it answers HTTP 429 when asked too often). It is not a documented public API, so it may change or stop answering. Without a sign-in, the limits are left out and everything else still works.
 
 Costs are **estimates** at Anthropic's API list prices (`mods/claude-usage/pricing.js`). On a Pro or Max plan you aren't billed per token; the figure shows what the same tokens would cost on the API.
 

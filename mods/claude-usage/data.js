@@ -23,7 +23,7 @@ import { addSamples, clock, forecast, resetKey } from "./forecast.js";
 export const MOD = "claude-usage";
 export const KEY = "claude-usage";
 const TICK = 20000;           // transcripts: a cheap listing, then only the new bytes
-const QUOTA_EVERY = 90000;    // the usage endpoint, never faster than once a minute
+const QUOTA_EVERY = 120000;   // the usage endpoint answers 429 when asked too often
 const QUOTA_BACKOFF = 300000; // after an error or an expired sign-in
 const LEASE_STALE = 100000;
 const HEARTBEAT = 45000;
